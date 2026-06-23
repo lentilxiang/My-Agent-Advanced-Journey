@@ -30,59 +30,75 @@ D08 学了理论 → D09 手写底层实现 → 彻底理解循环怎么运转
 
 ---
 
-## 2. 显式 ReAct 的协议设计
+## 2. 两种实现方案：文本 vs JSON
 
-### 2.1 让 LLM 按格式输出
+D09 代码支持两种模式，`--mode` 参数切换。默认用 Level 2。
+
+### Level 1 (TEXT)：文本协议 —— 2023 年 ReAct 论文的原版做法
+
+**做法：** System Prompt 教模型输出纯文本 `Thought: ... Action: ...` 格式，开发者用正则解析。
 
 ```
-通过 System Prompt 教模型按固定格式输出：
-
-  "You have access to the following tools:
-   1. search(query) - search the web
-   2. calculator(expr) - evaluate math expression
-   3. datetime() - get current date and time
-
-   When you need to use a tool, output EXACTLY:
-   Thought: <your reasoning about what to do next>
+Prompt 教模型：
+  "When you need to use a tool, output EXACTLY:
+   Thought: <your reasoning>
    Action: <tool_name>
-   Action Input: <parameters>
+   Action Input: <parameters>"
 
-   When you have the final answer, output EXACTLY:
-   Thought: I now have all the information needed.
-   Action: Finish
-   Action Input: <final answer to the user>"
-```
-
-### 2.2 LLM 会输出的文本格式
-
-```
-一轮对话中 LLM 的典型输出：
-
-  Thought: 用户想知道北京现在的温度。我需要搜索最新天气数据。
+模型输出（纯文本）：
+  Thought: 需要查北京温度
   Action: search
-  Action Input: 北京 2025年6月 当前温度
+  Action Input: 北京温度
 
-  Thought: 搜索结果显示北京现在 32°C。信息够了，可以回答。
-  Action: Finish
-  Action Input: 北京当前温度是 32°C，体感较热，建议做好防晒。
+开发者用正则解析：
+  thought = re.search(r"Thought:\s*(.+?)(?=\nAction:)", text)
+  action = re.search(r"Action:\s*(\S+)", text)
+  ...
+
+问题：
+  - 模型可能多写个空格、换行、中文冒号 → 正则匹配失败
+  - Action Input 里含换行 → DOTALL 标记易遗漏
+  - 每次解析失败就浪费一轮 token
+  - 这是 2023 年所有 Agent 框架最头疼的部分
 ```
 
-### 2.3 开发者需要做的解析
+### Level 2 (JSON)：结构化输出 —— 你应该用的方式
 
-```python
-import re
+**做法：** Prompt 要求模型输出 JSON，用 `response_format={"type": "json_object"}` 保证合法性，`json.loads()` 解析。
 
-def parse_react_output(text: str) -> dict:
-    """从 LLM 输出的文本中提取 Thought / Action / Action Input"""
-    thought_match = re.search(r"Thought:\s*(.+?)(?=\nAction:|\Z)", text, re.DOTALL)
-    action_match = re.search(r"Action:\s*(.+?)(?=\nAction Input:|\Z)", text)
-    action_input_match = re.search(r"Action Input:\s*(.+)", text, re.DOTALL)
+```
+Prompt 教模型：
+  "You MUST respond with a valid JSON object:
+   {"thought": "<reasoning>", "action": "<tool_name>", "action_input": "<params>"}"
 
-    return {
-        "thought": thought_match.group(1).strip() if thought_match else None,
-        "action": action_match.group(1).strip() if action_match else None,
-        "action_input": action_input_match.group(1).strip() if action_input_match else None
-    }
+模型输出（JSON）：
+  {"thought": "需要查北京温度", "action": "search", "action_input": "北京温度"}
+
+开发者用 json.loads() 解析：
+  parsed = json.loads(text)
+  action = parsed["action"]
+
+对比：
+  - 不需要正则可维护 ← 一行 json.loads() 搞定
+  - API 的 response_format 保证输出合法 JSON ← 成功率接近 100%
+  - 完全不需要兼容中文冒号、多余空格、换行等边界情况
+```
+
+**核心洞察：为什么 Level 2 能工作且更好？**
+
+```
+模型不需要 FC 训练就能输出 JSON。
+因为 "输出 JSON" 是一个通用能力（模型训练时见过海量 JSON 数据），
+不是 FC 专属能力。
+
+FC 训练给模型的额外能力是：
+  "识别 tools 参数 + 按 schema 填充 name/arguments 到 tool_calls 字段"
+这是特定输出格式的训练，跟会不会输出 JSON 无关。
+
+所以：
+  模型支持 FC → 直接用 FC（最省事，连解析都不需要）
+  模型不支持 FC → 但支持 JSON → 用 Level 2（json.loads 解析）
+  模型连 JSON 都不支持 → 用 Level 1（正则兜底，现在几乎不会遇到）
 ```
 
 ---
@@ -91,13 +107,17 @@ def parse_react_output(text: str) -> dict:
 
 ```
 react_agent.py
-├── Tool 类              → 工具基类：name, description, execute()
-├── 3 个工具             → search, calculator, datetime
-├── build_prompt()       → 组装 System Prompt + 工具列表 + 对话历史
-├── parse_react_output() → 正则提取 Thought / Action / Action Input
-├── execute_action()     → 根据 Action 名字找到工具并执行
-├── react_loop()         → 主循环：调 LLM → 解析 → 执行工具 → 拼回结果 → 循环
-└── main()               → 入口，交互式对话
+├── Tool 类                  → 工具基类：name, description, params_schema, execute()
+├── 3 个工具                 → SearchTool, CalculatorTool, DateTimeTool
+├── build_text_prompt()      → Level 1 的 System Prompt（教模型输出纯文本格式）
+├── build_json_prompt()      → Level 2 的 System Prompt（教模型输出 JSON）
+├── parse_text_output()      → 正则提取 Thought/Action/Action Input
+├── parse_json_output()      → json.loads() 解析，处理 markdown 包裹
+├── ReActAgent               → mode="json"|"text" 切换两种方案
+│   ├── _call_llm()          → json 模式加 response_format={"type":"json_object"}
+│   ├── _execute_action()    → 根据 action 名字找工具并执行
+│   └── run()                → 主循环：调 LLM → 解析 → 执行工具 → 拼回 → 循环
+└── main()                   → 入口，--mode json|text 参数切换
 ```
 
 ---
